@@ -19,3 +19,7 @@ checkpoints/
 # Run outputs are reproducible artifacts, not source.
 runs/*
 !runs/README.md
+
+# Agent worktrees and SDD scratch
+.worktrees/
+.superpowers/

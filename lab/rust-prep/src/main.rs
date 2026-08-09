@@ -1,11 +1,15 @@
 //! Stream a Lichess .pgn.zst archive into compact binary game records.
 //!
-//! Selection replicates lab/prepare.py with `--both-min-elo 1600 --no-bullet`
-//! exactly: Result must be 1-0 / 1/2-1/2 / 0-1; TimeControl base seconds
-//! (text before the first '+'; no '+' or unparseable => reject) must be
-//! >= 180; both WhiteElo and BlackElo must parse and be > 1600; games with
-//! SAN errors or zero moves are skipped. Games are taken in archive order
-//! until the target count is reached.
+//! Filter modes (4th CLI arg, default "both1600"):
+//!   both1600 — replicates lab/prepare.py with `--both-min-elo 1600 --no-bullet`
+//!     exactly: Result must be 1-0 / 1/2-1/2 / 0-1; TimeControl base seconds
+//!     (text before the first '+'; no '+' or unparseable => reject) must be
+//!     >= 180; both WhiteElo and BlackElo must parse and be > 1600.
+//!   w2400 — same Result/TimeControl gates, then: decisive games whose WINNER
+//!     Elo >= 2400 (loser unconstrained), plus drawn games where
+//!     max(WhiteElo, BlackElo) >= 2400. Both Elos must parse.
+//! In every mode games with SAN errors or zero moves are skipped and games are
+//! taken in archive order until the target count is reached.
 //!
 //! Output record (little-endian), one per accepted game:
 //!   [u8; 8] game id (ascii) | u16 white_elo | u16 black_elo | u8 result
@@ -64,7 +68,32 @@ struct Game {
     tags: Tags,
 }
 
-struct Collector;
+#[derive(Clone, Copy, PartialEq)]
+enum Filter {
+    Both1600,
+    W2400,
+}
+
+fn accepted(filter: Filter, tags: &Tags) -> bool {
+    // Shared gates first: parseable result, base time >= 180 s (no-bullet).
+    let Some(result) = tags.result else { return false };
+    if tags.base.unwrap_or(0) < 180 {
+        return false;
+    }
+    let (Some(w), Some(b)) = (tags.white_elo, tags.black_elo) else { return false };
+    match filter {
+        Filter::Both1600 => w.min(b) > 1600,
+        Filter::W2400 => match result {
+            0 => w >= 2400,          // white won: winner is white
+            2 => b >= 2400,          // black won: winner is black
+            _ => w.max(b) >= 2400,   // draw: stronger player >= 2400
+        },
+    }
+}
+
+struct Collector {
+    filter: Filter,
+}
 
 impl Visitor for Collector {
     type Tags = Tags;
@@ -118,12 +147,7 @@ impl Visitor for Collector {
     }
 
     fn begin_movetext(&mut self, tags: Tags) -> ControlFlow<Self::Output, Self::Movetext> {
-        // lab/prepare.py: RESULTS lookup, then no-bullet ((base or 0) < 180
-        // rejects), then both-min-elo (missing or min <= 1600 rejects).
-        let accepted = tags.result.is_some()
-            && tags.base.unwrap_or(0) >= 180
-            && matches!((tags.white_elo, tags.black_elo), (Some(w), Some(b)) if w.min(b) > 1600);
-        if !accepted {
+        if !accepted(self.filter, &tags) {
             return ControlFlow::Break(None); // reader skips the movetext tokens
         }
         if tags.site_seen && tags.game_id.is_none() {
@@ -153,13 +177,21 @@ impl Visitor for Collector {
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
-        eprintln!("usage: prepare-games <source.pgn.zst> <target-games> <output.bin>");
+    if args.len() != 4 && args.len() != 5 {
+        eprintln!("usage: prepare-games <source.pgn.zst> <target-games> <output.bin> [both1600|w2400]");
         std::process::exit(2);
     }
     let source = &args[1];
     let target: u64 = args[2].parse().expect("target games");
     let output = &args[3];
+    let filter = match args.get(4).map(String::as_str) {
+        None | Some("both1600") => Filter::Both1600,
+        Some("w2400") => Filter::W2400,
+        Some(other) => {
+            eprintln!("unknown filter mode: {other}");
+            std::process::exit(2);
+        }
+    };
 
     let started = Instant::now();
     let mut child = Command::new("zstd")
@@ -170,7 +202,7 @@ fn main() -> std::io::Result<()> {
     let mut reader = Reader::new(stdout);
     let mut out = BufWriter::with_capacity(1 << 20, File::create(output)?);
 
-    let mut collector = Collector;
+    let mut collector = Collector { filter };
     let (mut read, mut kept, mut positions) = (0u64, 0u64, 0u64);
     while kept < target {
         let Some(result) = reader.read_game(&mut collector)? else {

@@ -1,8 +1,9 @@
 """Prepare compact game-record shards (one row per game) from a raw Lichess PGN archive.
 
-Filters match the cancelled materialized-position prep (lab/prepare.py with
---both-min-elo 1600 --no-bullet): rated standard games, both Elo > 1600,
-base time >= 180 s. Instead of materializing per-position rows, each game is
+Filter modes match lab/rust-prep: "both1600" (rated standard, both Elo > 1600,
+base time >= 180 s — the cancelled materialized-position prep's filter) and
+"w2400" (base >= 180 s; decisive games with winner Elo >= 2400 plus drawn
+games with max Elo >= 2400). Instead of materializing per-position rows, each game is
 stored as a list of uint16 move words:
 
     bits 0-5 from-square, 6-11 to-square, 12-14 promotion
@@ -125,13 +126,23 @@ def game_row(game: chess.pgn.Game, result: int) -> dict[str, object] | None:
     }
 
 
-def accept(game: chess.pgn.Game) -> bool:
-    """Rated standard, both Elo > 1600, base >= 180 s (as lab/prepare.py)."""
+def _filter_ok(filter_mode: str, white: int, black: int, result: int) -> bool:
+    """Elo gate per filter mode (mirrors rust-prep's `accepted`)."""
+    if filter_mode == "w2400":
+        winner = white if result == 0 else black if result == 2 else max(white, black)
+        return winner >= 2400
+    return min(white, black) > 1600  # both1600
+
+
+def accept(game: chess.pgn.Game, result: int, filter_mode: str = "both1600") -> bool:
+    """Rated standard, base >= 180 s, plus the mode's Elo gate (as rust-prep)."""
     control = _time_control(game)
     if control is None or control[0] < 180:
         return False
     white, black = _elo(game, "WhiteElo"), _elo(game, "BlackElo")
-    return white is not None and black is not None and min(white, black) > 1600
+    if white is None or black is None:
+        return False
+    return _filter_ok(filter_mode, white, black, result)
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -166,7 +177,7 @@ def prepare(args: argparse.Namespace) -> None:
             result = RESULTS.get(game.headers.get("Result", ""))
             if result is None or game.errors:
                 continue
-            if not accept(game):
+            if not accept(game, result, args.filter):
                 continue
             row = game_row(game, result)
             if row is None:
@@ -271,7 +282,8 @@ def verify(args: argparse.Namespace) -> None:
         assert row["time_inc_s"] == min(255, max(0, int(inc_text))), f"{game_id}: time_inc_s"
         expected_term = TERMINATIONS.get(headers.get("Termination", ""), TERMINATION_OTHER)
         assert row["termination"] == expected_term, f"{game_id}: termination"
-        assert int(base_text) >= 180 and min(row["white_elo"], row["black_elo"]) > 1600, f"{game_id}: filter"
+        assert int(base_text) >= 180, f"{game_id}: time filter"
+        assert _filter_ok(args.filter, row["white_elo"], row["black_elo"], row["result"]), f"{game_id}: elo filter"
         checked += 1
 
     print(
@@ -297,6 +309,7 @@ def main() -> None:
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--sample-file", type=Path, help="jsonl of raw PGN text for a random sample")
     prep.add_argument("--sample-target", type=int, default=1000)
+    prep.add_argument("--filter", choices=("both1600", "w2400"), default="both1600")
     prep.set_defaults(func=prepare)
 
     check = sub.add_parser("verify", help="verify a shard against sampled raw PGN text")
@@ -305,6 +318,7 @@ def main() -> None:
     check.add_argument("--sample-file", type=Path, required=True)
     check.add_argument("--check-games", type=int, default=1000)
     check.add_argument("--seed", type=int, default=20260808)
+    check.add_argument("--filter", choices=("both1600", "w2400"), default="both1600")
     check.set_defaults(func=verify)
 
     args = parser.parse_args()

@@ -46,6 +46,12 @@ DEFAULTS = {
     "cnn_modern": False, "bilinear_head": False,
     "qkv_tie": "", "max_steps": 0, "time_budget_s": 0.0, "val_shard": "", "compile_mode": "",
     "ckpt_every_frac": 0.0, "resume_from": "",
+    # policy_winner_only: mask the policy CE to rows whose mover-relative result is a win
+    # (result == 0 after flip_in_place); the value loss still sees every row.
+    # schedule_total_steps: when > 0 the LR schedule (warmup + cosine) is computed against
+    # this horizon while max_steps still stops the run early — the cosine deliberately
+    # does NOT complete at stop.
+    "policy_winner_only": False, "schedule_total_steps": 0,
 }
 
 # Which projection each of q, k, v reads from. "" keeps the legacy fused qkv weight so
@@ -61,6 +67,10 @@ SHARD_SETS = {
     # compact game-record parquets, replayed to identical rows by lab/decode_games.py
     "fullbudget-games": [
         f"games:shards/games-2026-{month}.parquet" for month in ("01", "02", "03")
+    ],
+    # winner>=2400 decisive + max>=2400 draws, nobullet (rust-prep filter mode w2400)
+    "w2400-games": [
+        f"games:shards/games-2026-{month}-w2400.parquet" for month in ("01", "02", "03")
     ],
     **{
         f"slice67-{name}": [f"shards/slice67-{name}.parquet"]
@@ -645,6 +655,8 @@ def build_optimizer(model, r):
 
 
 def lr_scale(r, step, total):
+    if r["schedule_total_steps"] > 0:
+        total = r["schedule_total_steps"]  # long-horizon schedule; max_steps stops the run early
     warmup = max(1, int(total * r["warmup"])) if r["warmup"] > 0 else 0
     if step < warmup:
         return step / warmup
@@ -786,6 +798,9 @@ def main():
         if r["mega_corpus"]:
             shard_list += ["shards/enriched-chunk3.parquet", "shards/enriched-chunk4.parquet"]
     assert not (r["flip"] and r["aux_next_move"]), "next-move aux not flip-aware"
+    # result==0 means "mover won" only after flip_in_place canonicalizes; unflipped
+    # rows are white-relative and the mask would silently train on white wins only.
+    assert not r["policy_winner_only"] or r["flip"], "policy_winner_only requires flip"
     offset, parts = 0, []
     local_dir = os.environ.get("LOCAL_SHARDS", "")
     for shard in shard_list:
@@ -958,6 +973,15 @@ def main():
                     ce = torch.nn.functional.cross_entropy(out["policy"], train["target"][batch].long(), reduction="none")
                     p = torch.exp(-ce)
                     loss = ((1 - p) ** 2 * ce).mean()
+                elif r["policy_winner_only"]:
+                    # policy imitates only the eventual winner's moves (mover-relative
+                    # result == 0 after flip); value loss below still sees every row
+                    ce = torch.nn.functional.cross_entropy(
+                        out["policy"], train["target"][batch].long(),
+                        label_smoothing=r["label_smoothing"], reduction="none",
+                    )
+                    win = (train["result"][batch] == 0).float()
+                    loss = (ce * win).sum() / win.sum().clamp(min=1.0)
                 else:
                     loss = torch.nn.functional.cross_entropy(
                         out["policy"], train["target"][batch].long(), label_smoothing=r["label_smoothing"]

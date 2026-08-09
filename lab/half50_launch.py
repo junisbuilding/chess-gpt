@@ -10,7 +10,14 @@ holds 1,737,749 games / 146,535,128 positions (Jan 604,839g/51.07M, Feb
 558,805g/47.08M, Mar 574,105g/48.38M), comfortably above the 110M single-pass
 threshold, so epochs=1 — one fresh pass, max_steps stops it at 66% of the pool.
 
-Usage: uv run python lab/half50_launch.py smoke|run
+The anneal branch resumes the rolling step-94950 checkpoint and runs a
+2,850-step LR->0 cosine anneal: schedule_from_step opens a fresh schedule
+window [94950, 97800], warmup 0, starting exactly at the LR the main leg
+stopped on (1.2e-3 x lr_scale(94950) = 6.49834689130716e-4). Lineage FLOPs
+at the annealed checkpoint: 3 x 1,662,247,168 x 97,800 x 1024 =
+0.49941e18 < 0.50e18.
+
+Usage: uv run python lab/half50_launch.py smoke|run|anneal
 """
 
 import json
@@ -36,12 +43,23 @@ SMOKE = {
     "ckpt_every_frac": 0.34,
 }
 
+ANNEAL = {
+    **RECIPE, "id": "half50-w2400-anneal",
+    "resume_from": "results3/half50-w2400.resume.pt",
+    "lr": 0.000649834689130716,  # exact stop-point LR: 1.2e-3 * lr_scale at step 94950
+    "warmup": 0.0, "schedule": "cosine", "schedule_total_steps": 0,
+    "schedule_from_step": 94950, "max_steps": 97800,
+    "ckpt_every_frac": 0.0, "save_ckpt": True,
+}
+
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("smoke", "run"):
-        sys.exit("usage: half50_launch.py smoke|run")
-    recipe, timeout = (SMOKE, "25m") if mode == "smoke" else (RECIPE, "6h")
+    if mode not in ("smoke", "run", "anneal"):
+        sys.exit("usage: half50_launch.py smoke|run|anneal")
+    recipe, timeout = {
+        "smoke": (SMOKE, "25m"), "run": (RECIPE, "6h"), "anneal": (ANNEAL, "45m"),
+    }[mode]
     token = Path.home().joinpath(".cache/huggingface/token").read_text().strip()
     result = subprocess.run(
         [

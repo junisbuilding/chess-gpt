@@ -51,7 +51,10 @@ DEFAULTS = {
     # schedule_total_steps: when > 0 the LR schedule (warmup + cosine) is computed against
     # this horizon while max_steps still stops the run early — the cosine deliberately
     # does NOT complete at stop.
-    "policy_winner_only": False, "schedule_total_steps": 0,
+    # schedule_from_step: when > 0 warmup and cosine progress are computed within the
+    # window [schedule_from_step, total_steps] instead of [0, total_steps] — an anneal
+    # branch resumed at that step gets a fresh schedule over just the remaining steps.
+    "policy_winner_only": False, "schedule_total_steps": 0, "schedule_from_step": 0,
 }
 
 # Which projection each of q, k, v reads from. "" keeps the legacy fused qkv weight so
@@ -657,6 +660,9 @@ def build_optimizer(model, r):
 def lr_scale(r, step, total):
     if r["schedule_total_steps"] > 0:
         total = r["schedule_total_steps"]  # long-horizon schedule; max_steps stops the run early
+    if r["schedule_from_step"] > 0:  # schedule runs inside [schedule_from_step, total]
+        step = max(0, step - r["schedule_from_step"])
+        total = max(1, total - r["schedule_from_step"])
     warmup = max(1, int(total * r["warmup"])) if r["warmup"] > 0 else 0
     if step < warmup:
         return step / warmup
